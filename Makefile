@@ -3,11 +3,12 @@ SHELL := bash
 PYTHON ?= python3
 VENV ?= venv
 VENV_PY := $(VENV)/bin/python
-VENV_PIP := $(VENV)/bin/pip
+VENV_PIP := $(VENV_PY) -m pip
 
-# Pip mirrors
-PIP_INDEX ?= https://pypi.internal-mirrors.ucloud.cn/simple
-TORCH_INDEX ?= https://mirrors.nju.edu.cn/pytorch/whl/cu124
+# Pip / wheel indexes (override if you need a local mirror)
+PIP_INDEX ?= https://pypi.org/simple
+# Default to CUDA 12.4 wheels; override with a CPU index if needed.
+TORCH_INDEX ?= https://download.pytorch.org/whl/cu124
 
 # Local model directory
 MODEL_PATH ?= $(abspath models)
@@ -41,15 +42,20 @@ help:
 	@echo "  make api HOST=0.0.0.0 PORT=8000"
 
 venv:
-	@if test -x "$(VENV_PY)"; then \
-		echo "$(VENV) already exists"; \
-	else \
+	@set -euo pipefail; \
+	if ! test -x "$(VENV_PY)"; then \
 		$(PYTHON) -m venv "$(VENV)"; \
-	fi
+	fi; \
+	# Some minimal venvs may be created without pip; bootstrap it so other targets work.
+	if ! "$(VENV_PY)" -c "import pip" >/dev/null 2>&1; then \
+		"$(VENV_PY)" -m ensurepip --upgrade; \
+	fi; \
+	# Best-effort upgrades (offline environments should still work with ensurepip's wheels).
+	"$(VENV_PY)" -m pip install --upgrade pip setuptools wheel || \
+		echo "WARNING: pip upgrade failed (offline?). Continuing with bundled pip."
 
 install-base: venv
 	$(VENV_PIP) config set global.index-url $(PIP_INDEX)
-	$(VENV_PIP) install --upgrade pip setuptools
 	$(VENV_PIP) install torch==$(TORCH_VER) torchvision==$(TORCHVISION_VER) torchaudio==$(TORCHAUDIO_VER) \
 		--index-url $(TORCH_INDEX)
 

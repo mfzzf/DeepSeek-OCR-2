@@ -245,7 +245,7 @@ def build_app(
 
         stream = _get_bool(body, "stream", False)
         stream_options = body.get("stream_options") if isinstance(body.get("stream_options"), dict) else {}
-        include_usage = _get_bool(stream_options, "include_usage", False)
+        include_usage = _get_bool(stream_options, "include_usage", True)
         n = _get_int(body, "n", 1)
         if n != 1:
             raise HTTPException(status_code=400, detail="Only `n=1` is supported")

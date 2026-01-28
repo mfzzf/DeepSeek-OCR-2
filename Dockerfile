@@ -22,13 +22,13 @@ RUN pip3 install \
     addict \
     matplotlib
 
-COPY DeepSeek-OCR2-master /app/DeepSeek-OCR2-master
+
 COPY models /app/models
 
 ENV MODEL_PATH=/app/models
 
+COPY DeepSeek-OCR2-master /app/DeepSeek-OCR2-master
 WORKDIR /app/DeepSeek-OCR2-master/DeepSeek-OCR2-vllm
 EXPOSE 8000
-
 ENTRYPOINT []
 CMD ["python3", "openai_api_server.py", "--host", "0.0.0.0", "--port", "8000"]
