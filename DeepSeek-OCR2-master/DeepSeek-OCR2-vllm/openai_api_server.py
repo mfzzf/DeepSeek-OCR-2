@@ -31,6 +31,37 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
 
 
+def _safe_len(obj: Any) -> Optional[int]:
+    if obj is None:
+        return None
+    try:
+        return len(obj)  # type: ignore[arg-type]
+    except TypeError:
+        return None
+
+
+def _prompt_tokens_from_mm_data(mm_data: Any) -> Optional[int]:
+    # DeepseekOCR2Processor.tokenize_with_images returns:
+    # [[input_ids, pixel_values, images_crop, images_seq_mask, images_spatial_crop, num_image_tokens, image_shapes]]
+    try:
+        input_ids = mm_data[0][0]
+    except Exception:
+        return None
+
+    shape = getattr(input_ids, "shape", None)
+    if shape is not None:
+        try:
+            return int(shape[-1])
+        except Exception:
+            pass
+
+    # Fallback for list-like tensors.
+    try:
+        return len(input_ids[0])
+    except Exception:
+        return None
+
+
 def _is_data_url(url: str) -> bool:
     return url.startswith("data:")
 
@@ -186,6 +217,7 @@ def build_app(
     default_crop_mode: bool,
 ) -> FastAPI:
     app = FastAPI(title="DeepSeek-OCR-2 OpenAI-Compatible API")
+    processor = DeepseekOCR2Processor()
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -212,6 +244,8 @@ def build_app(
             raise HTTPException(status_code=400, detail="Request body must be a JSON object")
 
         stream = _get_bool(body, "stream", False)
+        stream_options = body.get("stream_options") if isinstance(body.get("stream_options"), dict) else {}
+        include_usage = _get_bool(stream_options, "include_usage", False)
         n = _get_int(body, "n", 1)
         if n != 1:
             raise HTTPException(status_code=400, detail="Only `n=1` is supported")
@@ -255,29 +289,48 @@ def build_app(
         req_id = _new_id("chatcmpl")
         created = _now_ts()
 
+        prompt_tokens_fallback: Optional[int] = None
         if images:
-            image_features = DeepseekOCR2Processor().tokenize_with_images(
+            image_features = processor.tokenize_with_images(
                 images=images,
                 prompt=prompt,
                 bos=True,
                 eos=True,
                 cropping=default_crop_mode,
             )
+            prompt_tokens_fallback = _prompt_tokens_from_mm_data(image_features)
             model_input: dict[str, Any] = {
                 "prompt": prompt,
                 "multi_modal_data": {"image": image_features},
             }
         else:
             model_input = {"prompt": prompt}
+            try:
+                prompt_tokens_fallback = len(processor.encode(prompt, bos=True, eos=False))
+            except Exception:
+                prompt_tokens_fallback = None
 
         if not stream:
             final_text = ""
             finish_reason: Optional[str] = None
+            prompt_tokens: Optional[int] = None
+            completion_tokens: Optional[int] = None
             async for request_output in engine.generate(model_input, sampling_params, req_id):
+                if prompt_tokens is None:
+                    prompt_tokens = _safe_len(getattr(request_output, "prompt_token_ids", None))
                 if request_output.outputs:
                     out0 = request_output.outputs[0]
                     final_text = getattr(out0, "text", final_text)
                     finish_reason = getattr(out0, "finish_reason", finish_reason)
+                    completion_tokens = _safe_len(getattr(out0, "token_ids", None)) or completion_tokens
+
+            if prompt_tokens is None:
+                prompt_tokens = prompt_tokens_fallback or 0
+            if completion_tokens is None:
+                try:
+                    completion_tokens = len(processor.tokenizer.encode(final_text, add_special_tokens=False))
+                except Exception:
+                    completion_tokens = 0
 
             return JSONResponse(
                 {
@@ -292,7 +345,11 @@ def build_app(
                             "finish_reason": finish_reason or "stop",
                         }
                     ],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    },
                 }
             )
 
@@ -314,13 +371,20 @@ def build_app(
 
             printed_len = 0
             finish_reason: Optional[str] = None
+            prompt_tokens: Optional[int] = None
+            completion_tokens: Optional[int] = None
+            final_text = ""
 
             async for request_output in engine.generate(model_input, sampling_params, req_id):
+                if prompt_tokens is None:
+                    prompt_tokens = _safe_len(getattr(request_output, "prompt_token_ids", None))
                 if not request_output.outputs:
                     continue
                 out0 = request_output.outputs[0]
                 text = getattr(out0, "text", "")
+                final_text = text
                 finish_reason = getattr(out0, "finish_reason", finish_reason)
+                completion_tokens = _safe_len(getattr(out0, "token_ids", None)) or completion_tokens
                 if len(text) <= printed_len:
                     continue
                 delta = text[printed_len:]
@@ -341,16 +405,32 @@ def build_app(
                     + "\n\n"
                 )
 
+            if prompt_tokens is None:
+                prompt_tokens = prompt_tokens_fallback or 0
+            if completion_tokens is None:
+                try:
+                    completion_tokens = len(processor.tokenizer.encode(final_text, add_special_tokens=False))
+                except Exception:
+                    completion_tokens = 0
+
+            final_payload: dict[str, Any] = {
+                "id": req_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": served_model_name,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason or "stop"}],
+            }
+            if include_usage:
+                final_payload["usage"] = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                }
+
             yield (
                 "data: "
                 + json.dumps(
-                    {
-                        "id": req_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": served_model_name,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason or "stop"}],
-                    },
+                    final_payload,
                     ensure_ascii=False,
                 )
                 + "\n\n"
@@ -406,4 +486,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
